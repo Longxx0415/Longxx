@@ -5,6 +5,7 @@ from sklearn.preprocessing import StandardScaler
 import statsmodels.api as sm
 from sklearn.linear_model import LassoCV
 from sklearn.feature_selection import SelectKBest, f_regression
+from scipy import stats
 
 # ==================== 配置区域 ====================
 DATA_PATH = 'data.csv'          # Data矩阵来源
@@ -71,6 +72,25 @@ for j in range(2):
     print(f"    保留主成分：{N_COMPONENTS}个，原始特征：{n_features}个")
     print(f"    方差贡献率：{np.round(var_ratio, 4)}")
     print(f"    累计贡献率：{np.round(var_ratio.sum(), 4)}")
+
+    # =================== 打印各主成分具体组成 ===================
+    print(f"\n    >>> 主成分载荷矩阵（6个主成分 × {n_features}个变量）:")
+    loadings_df = pd.DataFrame(
+        components.T,                       # shape: (n_features, n_components)
+        index=INPUT1_COLS,
+        columns=[f'PC{k+1}' for k in range(N_COMPONENTS)]
+    )
+    # 打印完整载荷表
+    print(loadings_df.round(4).to_string())
+
+    # 为每个主成分列出主要贡献变量（按|载荷|绝对值降序，展示前5）
+    print(f"\n    >>> 各主成分主要组成变量（按|载荷|降序，前5）:")
+    for k in range(N_COMPONENTS):
+        pc_loadings = loadings_df.iloc[:, k].abs().sort_values(ascending=False)
+        print(f"    PC{k+1} (方差贡献率: {var_ratio[k]:.4f}):")
+        for var_name, abs_load in pc_loadings.head(5).items():
+            actual_load = loadings_df.loc[var_name, f'PC{k+1}']
+            print(f"        {var_name}: {actual_load:+.4f}  (|{abs_load:.4f}|)")
 
     # 关键修改：H直接由Input1计算（非Data）
     # 将Input1代入主成分公式求得分，并按方差贡献率加权合成 Hi
@@ -231,64 +251,150 @@ Q_combined = np.zeros((n_depts, 2))
 Q_combined[:, 0] = w_Q1[0] * Q1[:, 0] + w_Q2[0] * Q2[:, 0]  # 正科
 Q_combined[:, 1] = w_Q1[1] * Q1[:, 1] + w_Q2[1] * Q2[:, 1]  # 副科
 
+from scipy import stats  # 确保顶部已导入
+
+# =================== 步骤7之后：假设检验 + 精度指标 ===================
+print(f"\n{'='*50}")
+print(">>> 总体均值与总体方差假设检验 + 预测精度指标")
+print(f"{'='*50}")
+
+alpha = 0.05
+test_metrics = {}
+
+for j, col_name in enumerate(OUTPUT_COLS):
+    actual = Output[:, j]
+    predicted = Q_combined[:, j]
+    residual = predicted - actual
+    n = len(actual)
+
+    print(f"\n--- {col_name} ---")
+
+    # 1. 配对 t 检验（总体均值）
+    t_stat, p_mean = stats.ttest_rel(predicted, actual)
+    mean_diff = np.mean(residual)
+    mean_conclusion = "通过" if p_mean > alpha else "未通过"
+    print(f"    [总体均值] 配对 t 检验: p={p_mean:.4f} → {mean_conclusion}")
+
+    # 2. F 检验（总体方差）
+    var_pred = np.var(predicted, ddof=1)
+    var_actual = np.var(actual, ddof=1)
+    if var_pred > var_actual:
+        f_stat = var_pred / var_actual
+        p_tail = 1 - stats.f.cdf(f_stat, n - 1, n - 1)
+    else:
+        f_stat = var_actual / var_pred
+        p_tail = 1 - stats.f.cdf(f_stat, n - 1, n - 1)
+    p_var_f = 2 * p_tail
+    if p_var_f > 1.0:
+        p_var_f = 1.0
+    f_conclusion = "通过" if p_var_f > alpha else "未通过"
+    print(f"    [总体方差] F 检验: p={p_var_f:.4f} → {f_conclusion}")
+
+    # 3. Levene 检验（稳健方差）
+    stat_lev, p_lev = stats.levene(predicted, actual)
+    lev_conclusion = "通过" if p_lev > alpha else "未通过"
+    print(f"    [总体方差] Levene 检验: p={p_lev:.4f} → {lev_conclusion}")
+
+    # 4. 精度指标
+    mae = np.mean(np.abs(residual))
+    rmse = np.sqrt(np.mean(residual ** 2))
+    ss_res = np.sum(residual ** 2)
+    ss_tot = np.sum((actual - np.mean(actual)) ** 2)
+    r2 = 1 - ss_res / ss_tot if ss_tot != 0 else 0.0
+    print(f"    [预测精度] MAE={mae:.4f}, RMSE={rmse:.4f}, R²={r2:.4f}")
+
+    test_metrics[col_name] = {
+        'p_mean': round(p_mean, 4),
+        'mean_conclusion': mean_conclusion,
+        'p_var_f': round(p_var_f, 4),
+        'f_conclusion': f_conclusion,
+        'p_lev': round(p_lev, 4),
+        'lev_conclusion': lev_conclusion,
+        'mae': round(mae, 4),
+        'rmse': round(rmse, 4),
+        'r2': round(r2, 4),
+    }
+
 # =================== 结果输出 ===================
 result = pd.DataFrame({
     '部门名称': df_pure['部门名称'].values,
-
-    # 实际编制
     '实有正科': Output[:, 0].astype(int),
     '实有副科': Output[:, 1].astype(int),
-
-    # Q1：基于Input1的PCA拟合值（训练集）
     'Q1_正科': np.round(Q1[:, 0], 2),
     'Q1_副科': np.round(Q1[:, 1], 2),
     'Q1正科差额': np.round(Q1[:, 0] - Output[:, 0], 2),
     'Q1副科差额': np.round(Q1[:, 1] - Output[:, 1], 2),
-
-    # Q2：基于Data2的回归预测值（新样本）
     'Q2_正科': np.round(Q2[:, 0], 2),
     'Q2_副科': np.round(Q2[:, 1], 2),
     'Q2正科差额': np.round(Q2[:, 0] - Output[:, 0], 2),
     'Q2副科差额': np.round(Q2[:, 1] - Output[:, 1], 2),
-
-    # Q_combined：组合预测（最终输出）
     'Qc_正科': np.round(Q_combined[:, 0], 2),
     'Qc_副科': np.round(Q_combined[:, 1], 2),
     'Qc正科差额': np.round(Q_combined[:, 0] - Output[:, 0], 2),
     'Qc副科差额': np.round(Q_combined[:, 1] - Output[:, 1], 2),
-
-
 })
 
-# 添加合计行
+# 合计行
 summary = pd.DataFrame([{
     '部门名称': '合计/平均',
-
     '实有正科': int(Output[:, 0].sum()),
     '实有副科': int(Output[:, 1].sum()),
-
     'Q1_正科': np.round(Q1[:, 0].sum(), 2),
     'Q1_副科': np.round(Q1[:, 1].sum(), 2),
     'Q1正科差额': np.round(Q1[:, 0].sum() - Output[:, 0].sum(), 2),
     'Q1副科差额': np.round(Q1[:, 1].sum() - Output[:, 1].sum(), 2),
-
     'Q2_正科': np.round(Q2[:, 0].sum(), 2),
     'Q2_副科': np.round(Q2[:, 1].sum(), 2),
     'Q2正科差额': np.round(Q2[:, 0].sum() - Output[:, 0].sum(), 2),
     'Q2副科差额': np.round(Q2[:, 1].sum() - Output[:, 1].sum(), 2),
-
     'Qc_正科': np.round(Q_combined[:, 0].sum(), 2),
     'Qc_副科': np.round(Q_combined[:, 1].sum(), 2),
     'Qc正科差额': np.round(Q_combined[:, 0].sum() - Output[:, 0].sum(), 2),
     'Qc副科差额': np.round(Q_combined[:, 1].sum() - Output[:, 1].sum(), 2),
-
-
 }])
 result = pd.concat([result, summary], ignore_index=True)
 
+# =================== 追加假设检验与评价指标（含通过结论） ===================
+test_rows = pd.DataFrame([
+    {'部门名称': '--- 假设检验与评价指标 ---'},
+    {'部门名称': '配对t检验(p值)',
+     '实有正科': f"{test_metrics['正科']['p_mean']} ({test_metrics['正科']['mean_conclusion']})",
+     '实有副科': f"{test_metrics['副科']['p_mean']} ({test_metrics['副科']['mean_conclusion']})"},
+    {'部门名称': 'F检验(p值)',
+     '实有正科': f"{test_metrics['正科']['p_var_f']} ({test_metrics['正科']['f_conclusion']})",
+     '实有副科': f"{test_metrics['副科']['p_var_f']} ({test_metrics['副科']['f_conclusion']})"},
+    {'部门名称': 'Levene检验(p值)',
+     '实有正科': f"{test_metrics['正科']['p_lev']} ({test_metrics['正科']['lev_conclusion']})",
+     '实有副科': f"{test_metrics['副科']['p_lev']} ({test_metrics['副科']['lev_conclusion']})"},
+    {'部门名称': 'MAE',
+     '实有正科': test_metrics['正科']['mae'],
+     '实有副科': test_metrics['副科']['mae']},
+    {'部门名称': 'RMSE',
+     '实有正科': test_metrics['正科']['rmse'],
+     '实有副科': test_metrics['副科']['rmse']},
+    {'部门名称': 'R²',
+     '实有正科': test_metrics['正科']['r2'],
+     '实有副科': test_metrics['副科']['r2']},
+])
+result = pd.concat([result, test_rows], ignore_index=True)
+
+# 打印预览
 print("\n=== 结果预览 ===")
 print(result.to_string(index=False))
 
-# 保存
-result.to_csv('result_编制预测.csv', index=False, encoding='utf-8-sig')
-print(f"\n[完成] 结果已保存至：result_编制预测.csv")
+# 保存CSV（带防占用处理）
+import os
+script_dir = os.path.dirname(os.path.abspath(__file__))
+save_path = os.path.join(script_dir, 'result_编制预测.csv')
+counter = 1
+while os.path.exists(save_path):
+    try:
+        with open(save_path, 'a'):
+            pass
+        break
+    except PermissionError:
+        save_path = os.path.join(script_dir, f'result_编制预测_{counter}.csv')
+        counter += 1
+
+result.to_csv(save_path, index=False, encoding='utf-8-sig')
+print(f"\n[完成] 结果已保存至：{save_path}")
