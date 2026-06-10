@@ -373,7 +373,29 @@ print(f"{'='*60}")
 Qc_test_split = np.zeros((n_test, 3))
 for i in range(n_test):
     Qc_test_split[i] = split_total(Qc_total_test[i])
+# 测试集约束（新增）
+Qc_test_adj_total = np.zeros(n_test)
+Qc_test_adj_split = np.zeros((n_test, 3))
 
+for i in range(n_test):
+    total_before = Qc_total_test[i]
+    budget = Budget_test[i]
+    Qc_test_adj_split[i] = budget_adjust(total_before, budget)
+    Qc_test_adj_total[i] = Qc_test_adj_split[i].sum()
+
+print(f"\n--- 6.1b 测试集拆分（约束后，2:3:5）---")
+for j, name in enumerate(OUTPUT_COLS):
+    print(f"    {name}: 合计={Qc_test_adj_split[:,j].sum():.2f}, 均值={Qc_test_adj_split[:,j].mean():.2f}")
+print(f"    总编制合计: {Qc_test_adj_split.sum():.2f}")
+print(f"    预算约束合计: {Budget_test.sum():.0f}")
+
+print(f"\n--- 6.1c 测试集超预算部门 ---")
+for i in range(n_test):
+    total_before = Qc_total_test[i]
+    if total_before > Budget_test[i] + 0.01:
+        print(f"    {df_test.iloc[i]['部门名称']}:")
+        print(f"        预算={Budget_test[i]:.0f}, 约束前={total_before:.2f}, 约束后={Qc_test_adj_total[i]:.2f}")
+        print(f"        拆分: 正科={Qc_test_adj_split[i,0]:.2f}, 副科={Qc_test_adj_split[i,1]:.2f}, 科以下={Qc_test_adj_split[i,2]:.2f}")
 print(f"--- 6.1 测试集拆分（无约束，2:3:5）---")
 for j, name in enumerate(OUTPUT_COLS):
     print(f"    {name}: 合计={Qc_test_split[:,j].sum():.2f}, 均值={Qc_test_split[:,j].mean():.2f}")
@@ -560,3 +582,38 @@ print("[完成] 结果保存")
 print(f"{'='*60}")
 print(f"测试集指标已保存至：{save_path_test}")
 print(f"预测集结果已保存至：{save_path_forecast}")
+# =================== 测试集约束结果输出（新增） ===================
+test_result = pd.DataFrame({
+    '大类': df_test['大类'].values,
+    '部门名称': df_test['部门名称'].values,
+    '预算约束人数': Budget_test.astype(int),
+    '约束前_总编制': np.round(Qc_total_test, 2),
+    '约束前_正科': np.round(Qc_test_split[:, 0], 2),
+    '约束前_副科': np.round(Qc_test_split[:, 1], 2),
+    '约束前_科级以下': np.round(Qc_test_split[:, 2], 2),
+    '约束后_总编制': np.round(Qc_test_adj_total, 2),
+    '约束后_正科': np.round(Qc_test_adj_split[:, 0], 2),
+    '约束后_副科': np.round(Qc_test_adj_split[:, 1], 2),
+    '约束后_科级以下': np.round(Qc_test_adj_split[:, 2], 2),
+})
+
+test_summary_df = pd.DataFrame([{
+    '大类': '合计',
+    '部门名称': '-',
+    '预算约束人数': int(Budget_test.sum()),
+    '约束前_总编制': np.round(Qc_total_test.sum(), 2),
+    '约束前_正科': np.round(Qc_test_split[:, 0].sum(), 2),
+    '约束前_副科': np.round(Qc_test_split[:, 1].sum(), 2),
+    '约束前_科级以下': np.round(Qc_test_split[:, 2].sum(), 2),
+    '约束后_总编制': np.round(Qc_test_adj_total.sum(), 2),
+    '约束后_正科': np.round(Qc_test_adj_split[:, 0].sum(), 2),
+    '约束后_副科': np.round(Qc_test_adj_split[:, 1].sum(), 2),
+    '约束后_科级以下': np.round(Qc_test_adj_split[:, 2].sum(), 2),
+}])
+test_result = pd.concat([test_result, test_summary_df], ignore_index=True)
+
+print("\n=== 测试集约束前与约束后结果 ===")
+print(test_result.to_string(index=False))
+
+save_path_test_result = safe_save(test_result, 'result_total_test_forecast.csv')
+print(f"测试集约束结果已保存至：{save_path_test_result}")
