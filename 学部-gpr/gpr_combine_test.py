@@ -22,6 +22,7 @@ TRAIN_2025_PATH = os.path.join(BASE_DIR, 'data2025.csv')
 TRAIN_2026_PATH = os.path.join(BASE_DIR, 'data2026.csv')
 PREDICT_2030_PATH = os.path.join(BASE_DIR, 'forecastdata.csv')
 OFFICIAL_OLS_XLSX = os.path.join(BASE_DIR, '测算数据（两个参数）.xlsx')
+OFFICIAL_OLS_XLSX_BACKUP = os.path.join(BASE_DIR, '测算数据（两个参数）_backup.xlsx')
 
 EXCLUDE_NAMES = ['上海国际知识产权学院', '中德工程学院，职业技术教育学院']
 
@@ -46,22 +47,26 @@ def load_data(path, exclude_names):
 
 
 def match_official_ols(dept_names, df_official):
-    """匹配官方OLS拟合值（参数1），支持模糊匹配"""
+    """匹配官方OLS拟合值（参数1和参数2），支持模糊匹配"""
     official_param1 = []
+    official_param2 = []
     for name in dept_names:
         match = df_official[df_official['单位'] == name]
         if len(match) > 0:
             official_param1.append(match['拟合数\n（参数1）'].values[0])
+            official_param2.append(match['拟合数\n（参数2）'].values[0])
             continue
         for idx, off_name in enumerate(df_official['单位']):
             if pd.isna(off_name):
                 continue
             if name in off_name or off_name in name:
                 official_param1.append(df_official.iloc[idx]['拟合数\n（参数1）'])
+                official_param2.append(df_official.iloc[idx]['拟合数\n（参数2）'])
                 break
         else:
             official_param1.append(np.nan)
-    return np.array(official_param1)
+            official_param2.append(np.nan)
+    return np.array(official_param1), np.array(official_param2)
 
 
 def budget_adjust(total_pred, B_budget, org_count):
@@ -174,8 +179,11 @@ def generate_feature_combos():
 def main():
     COMBOS_25TO26, COMBOS_26TO30 = generate_feature_combos()
 
-    # 读取官方OLS数据（sheet2：含组织员）
-    df_official = pd.read_excel(OFFICIAL_OLS_XLSX, sheet_name='含组织员')
+    # 读取官方OLS数据
+    # 非backup文件：用于30年预测比较（参数1）
+    df_official_30 = pd.read_excel(OFFICIAL_OLS_XLSX, sheet_name='含组织员')
+    # backup文件：用于26年自预测比较（参数1和参数2）
+    df_official_26 = pd.read_excel(OFFICIAL_OLS_XLSX_BACKUP, sheet_name='含组织员')
 
     # 读取各年数据
     df_train_25 = load_data(TRAIN_2025_PATH, EXCLUDE_NAMES)
@@ -187,8 +195,11 @@ def main():
     df_train_26 = df_train_26.set_index('部门名称').reindex(dept_names).reset_index()
     df_pred_30 = df_pred_30.set_index('部门名称').reindex(dept_names).reset_index()
 
-    # 获取官方拟合值（参数1）
-    official_param1 = match_official_ols(dept_names, df_official)
+    # 获取官方拟合值
+    # 30年比较：非backup文件的参数1
+    official_param1_30, _ = match_official_ols(dept_names, df_official_30)
+    # 26年自预测比较：backup文件的参数1和参数2
+    official_param1_26, official_param2_26 = match_official_ols(dept_names, df_official_26)
 
     # 获取组织员人数和实际编制
     org_counts_26 = df_train_26['组织员人数'].values.astype(int)
@@ -200,9 +211,11 @@ def main():
     n_depts = len(dept_names)
 
     # 存储结果
-    metrics_25to26 = {}  # 25→26精度指标
-    all_pred_30 = {}     # 30年预测（未约束，含组织员）
-    mae_30_vs_official = {}  # 30年vs参数1的MAE
+    metrics_25to26 = {}        # 25→26精度指标
+    all_pred_30 = {}           # 30年预测（未约束，含组织员）
+    mae_30_vs_official = {}    # 30年vs非backup参数1的MAE
+    all_pred_26_self = {}      # 26→26自预测（未约束，含组织员）
+    mae_26_self_vs_official = {}  # 26自预测vs backup参数1的MAE
 
     # ==================== 模式1：25→26 验证（仅计算精度指标）====================
     print("=" * 80)
@@ -239,9 +252,9 @@ def main():
         # 精度指标（vs实际）
         metrics_26 = evaluate_metrics(y_pred_26, y_actual)
 
-        # 与参数1比较（未约束含组织员）
-        mae_off1 = np.mean(np.abs(y_pred_26 - official_param1))
-        rmse_off1 = np.sqrt(np.mean((y_pred_26 - official_param1) ** 2))
+        # 与backup参数1比较（未约束含组织员）
+        mae_off1 = np.mean(np.abs(y_pred_26 - official_param1_26))
+        rmse_off1 = np.sqrt(np.mean((y_pred_26 - official_param1_26) ** 2))
 
         metrics_25to26[combo_name] = {
             'mae_actual': metrics_26['mae'],
@@ -261,11 +274,88 @@ def main():
         print(f"\n[{combo_idx + 1}/{len(COMBOS_25TO26)}] {combo_name}")
         print(f"  vs实际: MAE={metrics_26['mae']:.3f}, RMSE={metrics_26['rmse']:.3f}, "
               f"R²={metrics_26['r2']:.3f}, t_p={metrics_26['p_mean']:.3f}")
-        print(f"  vs参数1: MAE={mae_off1:.3f}, RMSE={rmse_off1:.3f}")
+        print(f"  vs backup参数1: MAE={mae_off1:.3f}, RMSE={rmse_off1:.3f}")
 
-    # ==================== 模式2：26→30 预测 ====================
+    # ==================== 模式2：26→26 自预测 ====================
     print("\n" + "=" * 80)
-    print(">>> 模式二：2026年训练 → 2030年预测")
+    print(">>> 模式二：2026年训练 → 2026年自预测（与backup官方OLS拟合值比较）")
+    print("=" * 80)
+
+    for combo_idx, combo in enumerate(COMBOS_26TO30):
+        combo_name = combo['name']
+        feature_cols = combo['cols']
+
+        missing_cols = [c for c in feature_cols if c not in df_train_26.columns]
+        if missing_cols:
+            print(f"\n[跳过] 组合 {combo_name}: 缺少特征列 {missing_cols}")
+            continue
+
+        X_train = df_train_26[feature_cols].values.astype(float)
+        y_train = df_train_26['编制人数'].values.astype(float)
+        X_pred = df_train_26[feature_cols].values.astype(float)
+        y_actual = df_train_26['编制人数'].values.astype(float)
+
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_pred_scaled = scaler.transform(X_pred)
+
+        gpr = GaussianProcessRegressor(
+            kernel=KERNEL, n_restarts_optimizer=50, normalize_y=True,
+            alpha=1e-2, random_state=RANDOM_STATE
+        )
+        gpr.fit(X_train_scaled, y_train)
+
+        y_pred_26_self, y_std_26_self = gpr.predict(X_pred_scaled, return_std=True)
+        y_pred_26_self = np.maximum(y_pred_26_self, 0)
+        all_pred_26_self[combo_name] = y_pred_26_self.copy()
+
+        # 与backup参数1比较（未约束含组织员）
+        mae_off1 = np.mean(np.abs(y_pred_26_self - official_param1_26))
+        rmse_off1 = np.sqrt(np.mean((y_pred_26_self - official_param1_26) ** 2))
+        mae_26_self_vs_official[combo_name] = mae_off1
+
+        # 与backup参数2比较
+        mae_off2 = np.mean(np.abs(y_pred_26_self - official_param2_26))
+        rmse_off2 = np.sqrt(np.mean((y_pred_26_self - official_param2_26) ** 2))
+
+        # 精度指标（vs实际）
+        metrics_26_self = evaluate_metrics(y_pred_26_self, y_actual)
+
+        # 预算约束 + 减去组织员 + 2:3:5拆分
+        adj_total_26 = np.zeros(n_depts)
+        adj_split_26 = np.zeros((n_depts, 3))
+        for i in range(n_depts):
+            adj_total_26[i], adj_split_26[i] = budget_adjust(
+                y_pred_26_self[i], budget_26[i], org_counts_26[i]
+            )
+
+        print(f"\n[{combo_idx + 1}/{len(COMBOS_26TO30)}] {combo_name}")
+        print(f"  vs实际: MAE={metrics_26_self['mae']:.3f}, RMSE={metrics_26_self['rmse']:.3f}, "
+              f"R²={metrics_26_self['r2']:.3f}, t_p={metrics_26_self['p_mean']:.3f}")
+        print(f"  vs backup参数1: MAE={mae_off1:.3f}, RMSE={rmse_off1:.3f}")
+        print(f"  vs backup参数2: MAE={mae_off2:.3f}, RMSE={rmse_off2:.3f}")
+        print(f"  预测合计(含组织员): {y_pred_26_self.sum():.2f}, 约束后: {adj_total_26.sum():.2f}")
+
+        # 保存该组合的详细结果（约束后）
+        detail_df = pd.DataFrame({
+            '部门名称': dept_names,
+            '实际编制': y_actual.astype(int),
+            'GPR预测(含组织员)': np.round(y_pred_26_self, 2),
+            'GPR_std': np.round(y_std_26_self, 2),
+            '预算约束': budget_26.astype(int),
+            '约束后总编(含组织员)': np.round(adj_total_26, 2),
+            '正科(20%)': np.round(adj_split_26[:, 0], 2),
+            '副科(30%)': np.round(adj_split_26[:, 1], 2),
+            '科级以下(50%)': np.round(adj_split_26[:, 2], 2),
+        })
+        detail_df.to_csv(
+            os.path.join(BASE_DIR, f'gpr_26_self_detail_{combo_name}.csv'),
+            index=False, encoding='utf-8-sig'
+        )
+
+    # ==================== 模式3：26→30 预测 ====================
+    print("\n" + "=" * 80)
+    print(">>> 模式三：2026年训练 → 2030年预测（与非backup官方参数1比较）")
     print("=" * 80)
 
     for combo_idx, combo in enumerate(COMBOS_26TO30):
@@ -295,9 +385,9 @@ def main():
         y_pred_30 = np.maximum(y_pred_30, 0)
         all_pred_30[combo_name] = y_pred_30.copy()
 
-        # 与参数1比较（未约束含组织员）
-        mae_off1 = np.mean(np.abs(y_pred_30 - official_param1))
-        rmse_off1 = np.sqrt(np.mean((y_pred_30 - official_param1) ** 2))
+        # 与非backup参数1比较（未约束含组织员）
+        mae_off1 = np.mean(np.abs(y_pred_30 - official_param1_30))
+        rmse_off1 = np.sqrt(np.mean((y_pred_30 - official_param1_30) ** 2))
         mae_30_vs_official[combo_name] = mae_off1
 
         # 预算约束 + 减去组织员 + 2:3:5拆分
@@ -309,7 +399,7 @@ def main():
             )
 
         print(f"\n[{combo_idx + 1}/{len(COMBOS_26TO30)}] {combo_name}")
-        print(f"  vs参数1: MAE={mae_off1:.3f}, RMSE={rmse_off1:.3f}")
+        print(f"  vs非backup参数1: MAE={mae_off1:.3f}, RMSE={rmse_off1:.3f}")
         print(f"  预测合计(含组织员): {y_pred_30.sum():.2f}, 约束后: {adj_total_30.sum():.2f}")
 
         # 保存该组合的详细结果（约束后）
@@ -328,9 +418,171 @@ def main():
             index=False, encoding='utf-8-sig'
         )
 
-    # ==================== 按MAE排序并生成汇总表 ====================
+    # ==================== 生成26自预测汇总表 ====================
     print("\n" + "=" * 80)
-    print(">>> 生成汇总表格（按30年MAE_vs参数1排序）")
+    print(">>> 生成26自预测汇总表格（按26自预测MAE_vs backup参数1排序）")
+    print("=" * 80)
+
+    # 按26自预测MAE排序
+    sorted_combos_26 = sorted(mae_26_self_vs_official.items(), key=lambda x: x[1])
+    sorted_combo_names_26 = [name for name, _ in sorted_combos_26]
+
+    # 构建summary表主体（各学院数据）
+    summary_data_26 = {
+        '部门名称': dept_names,
+        '官方参数1_backup': np.round(official_param1_26, 2),
+        '官方参数2_backup': np.round(official_param2_26, 2),
+        '2026实际编制': y_actual_26.astype(int),
+    }
+
+    for combo_name in sorted_combo_names_26:
+        pred = all_pred_26_self[combo_name]
+        diff = pred - official_param1_26
+        summary_data_26[f'{combo_name}_预测'] = np.round(pred, 2)
+        summary_data_26[f'{combo_name}_差值'] = np.round(diff, 2)
+
+    summary_df_26 = pd.DataFrame(summary_data_26)
+
+    # 在底部添加汇总行
+    metric_rows_26 = []
+
+    # R²
+    row_r2 = {'部门名称': '【汇总】R²', '官方参数1_backup': '', '官方参数2_backup': '', '2026实际编制': ''}
+    for combo_name in sorted_combo_names_26:
+        if combo_name in metrics_25to26:
+            row_r2[f'{combo_name}_预测'] = round(metrics_25to26[combo_name]['r2'], 3)
+            row_r2[f'{combo_name}_差值'] = ''
+        else:
+            row_r2[f'{combo_name}_预测'] = ''
+            row_r2[f'{combo_name}_差值'] = ''
+    metric_rows_26.append(row_r2)
+
+    # MAPE
+    row_mape = {'部门名称': '【汇总】MAPE(%)', '官方参数1_backup': '', '官方参数2_backup': '', '2026实际编制': ''}
+    for combo_name in sorted_combo_names_26:
+        if combo_name in metrics_25to26:
+            row_mape[f'{combo_name}_预测'] = round(metrics_25to26[combo_name]['mape'], 3)
+            row_mape[f'{combo_name}_差值'] = ''
+        else:
+            row_mape[f'{combo_name}_预测'] = ''
+            row_mape[f'{combo_name}_差值'] = ''
+    metric_rows_26.append(row_mape)
+
+    # t_p
+    row_tp = {'部门名称': '【汇总】t_p(均值检验)', '官方参数1_backup': '', '官方参数2_backup': '', '2026实际编制': ''}
+    for combo_name in sorted_combo_names_26:
+        if combo_name in metrics_25to26:
+            row_tp[f'{combo_name}_预测'] = round(metrics_25to26[combo_name]['t_p'], 3)
+            row_tp[f'{combo_name}_差值'] = ''
+        else:
+            row_tp[f'{combo_name}_预测'] = ''
+            row_tp[f'{combo_name}_差值'] = ''
+    metric_rows_26.append(row_tp)
+
+    # 均值检验结论
+    row_mean = {'部门名称': '【汇总】均值检验结论', '官方参数1_backup': '', '官方参数2_backup': '', '2026实际编制': ''}
+    for combo_name in sorted_combo_names_26:
+        if combo_name in metrics_25to26:
+            row_mean[f'{combo_name}_预测'] = metrics_25to26[combo_name]['mean_conclusion']
+            row_mean[f'{combo_name}_差值'] = ''
+        else:
+            row_mean[f'{combo_name}_预测'] = ''
+            row_mean[f'{combo_name}_差值'] = ''
+    metric_rows_26.append(row_mean)
+
+    # F_p
+    row_var = {'部门名称': '【汇总】F_p(方差检验)', '官方参数1_backup': '', '官方参数2_backup': '', '2026实际编制': ''}
+    for combo_name in sorted_combo_names_26:
+        if combo_name in metrics_25to26:
+            row_var[f'{combo_name}_预测'] = round(metrics_25to26[combo_name]['p_var_f'], 3)
+            row_var[f'{combo_name}_差值'] = ''
+        else:
+            row_var[f'{combo_name}_预测'] = ''
+            row_var[f'{combo_name}_差值'] = ''
+    metric_rows_26.append(row_var)
+
+    # 方差检验结论
+    row_var_c = {'部门名称': '【汇总】方差检验结论', '官方参数1_backup': '', '官方参数2_backup': '', '2026实际编制': ''}
+    for combo_name in sorted_combo_names_26:
+        if combo_name in metrics_25to26:
+            row_var_c[f'{combo_name}_预测'] = metrics_25to26[combo_name]['f_conclusion']
+            row_var_c[f'{combo_name}_差值'] = ''
+        else:
+            row_var_c[f'{combo_name}_预测'] = ''
+            row_var_c[f'{combo_name}_差值'] = ''
+    metric_rows_26.append(row_var_c)
+
+    # Levene_p
+    row_lev = {'部门名称': '【汇总】Levene_p', '官方参数1_backup': '', '官方参数2_backup': '', '2026实际编制': ''}
+    for combo_name in sorted_combo_names_26:
+        if combo_name in metrics_25to26:
+            row_lev[f'{combo_name}_预测'] = round(metrics_25to26[combo_name]['p_lev'], 3)
+            row_lev[f'{combo_name}_差值'] = ''
+        else:
+            row_lev[f'{combo_name}_预测'] = ''
+            row_lev[f'{combo_name}_差值'] = ''
+    metric_rows_26.append(row_lev)
+
+    # Levene检验结论
+    row_lev_c = {'部门名称': '【汇总】Levene检验结论', '官方参数1_backup': '', '官方参数2_backup': '', '2026实际编制': ''}
+    for combo_name in sorted_combo_names_26:
+        if combo_name in metrics_25to26:
+            row_lev_c[f'{combo_name}_预测'] = metrics_25to26[combo_name]['lev_conclusion']
+            row_lev_c[f'{combo_name}_差值'] = ''
+        else:
+            row_lev_c[f'{combo_name}_预测'] = ''
+            row_lev_c[f'{combo_name}_差值'] = ''
+    metric_rows_26.append(row_lev_c)
+
+    # MAE_vs backup参数1（26自预测）
+    row_mae_26 = {'部门名称': '【汇总】MAE_vs参数1(26自预测)', '官方参数1_backup': '', '官方参数2_backup': '', '2026实际编制': ''}
+    for combo_name in sorted_combo_names_26:
+        row_mae_26[f'{combo_name}_预测'] = round(mae_26_self_vs_official[combo_name], 3)
+        row_mae_26[f'{combo_name}_差值'] = ''
+    metric_rows_26.append(row_mae_26)
+
+    # RMSE_vs backup参数1（26自预测）
+    row_rmse_26_p1 = {'部门名称': '【汇总】RMSE_vs参数1(26自预测)', '官方参数1_backup': '', '官方参数2_backup': '', '2026实际编制': ''}
+    for combo_name in sorted_combo_names_26:
+        if combo_name in metrics_25to26:
+            row_rmse_26_p1[f'{combo_name}_预测'] = round(metrics_25to26[combo_name]['rmse_off1'], 3)
+            row_rmse_26_p1[f'{combo_name}_差值'] = ''
+        else:
+            row_rmse_26_p1[f'{combo_name}_预测'] = ''
+            row_rmse_26_p1[f'{combo_name}_差值'] = ''
+    metric_rows_26.append(row_rmse_26_p1)
+
+    # MAE_vs backup参数2（26自预测）
+    row_mae_26_p2 = {'部门名称': '【汇总】MAE_vs参数2(26自预测)', '官方参数1_backup': '', '官方参数2_backup': '', '2026实际编制': ''}
+    for combo_name in sorted_combo_names_26:
+        pred = all_pred_26_self[combo_name]
+        mae_off2 = np.mean(np.abs(pred - official_param2_26))
+        row_mae_26_p2[f'{combo_name}_预测'] = round(mae_off2, 3)
+        row_mae_26_p2[f'{combo_name}_差值'] = ''
+    metric_rows_26.append(row_mae_26_p2)
+
+    # RMSE_vs backup参数2（26自预测）
+    row_rmse_26_p2 = {'部门名称': '【汇总】RMSE_vs参数2(26自预测)', '官方参数1_backup': '', '官方参数2_backup': '', '2026实际编制': ''}
+    for combo_name in sorted_combo_names_26:
+        pred = all_pred_26_self[combo_name]
+        rmse_off2 = np.sqrt(np.mean((pred - official_param2_26) ** 2))
+        row_rmse_26_p2[f'{combo_name}_预测'] = round(rmse_off2, 3)
+        row_rmse_26_p2[f'{combo_name}_差值'] = ''
+    metric_rows_26.append(row_rmse_26_p2)
+
+    # 合并汇总行
+    for row in metric_rows_26:
+        summary_df_26 = pd.concat([summary_df_26, pd.DataFrame([row])], ignore_index=True)
+
+    summary_df_26.to_csv(
+        os.path.join(BASE_DIR, 'summary_26_self_prediction.csv'),
+        index=False, encoding='utf-8-sig'
+    )
+    print(f"[保存] summary_26_self_prediction.csv")
+
+    # ==================== 生成30年预测汇总表 ====================
+    print("\n" + "=" * 80)
+    print(">>> 生成30年预测汇总表格（按30年MAE_vs非backup参数1排序）")
     print("=" * 80)
 
     # 按30年MAE排序
@@ -340,13 +592,13 @@ def main():
     # 构建summary表主体（各学院数据）
     summary_data = {
         '部门名称': dept_names,
-        '官方参数1': np.round(official_param1, 2),
+        '官方参数1': np.round(official_param1_30, 2),
         '2026实际编制': y_actual_26.astype(int),
     }
 
     for combo_name in sorted_combo_names:
         pred = all_pred_30[combo_name]
-        diff = pred - official_param1
+        diff = pred - official_param1_30
         summary_data[f'{combo_name}_预测'] = np.round(pred, 2)
         summary_data[f'{combo_name}_差值'] = np.round(diff, 2)
 
@@ -443,7 +695,7 @@ def main():
             row_lev_c[f'{combo_name}_差值'] = ''
     metric_rows.append(row_lev_c)
 
-    # MAE_vs参数1（30年）
+    # MAE_vs非backup参数1（30年）
     row_mae_30 = {'部门名称': '【汇总】MAE_vs参数1(30年)', '官方参数1': '', '2026实际编制': ''}
     for combo_name in sorted_combo_names:
         row_mae_30[f'{combo_name}_预测'] = round(mae_30_vs_official[combo_name], 3)
@@ -479,7 +731,7 @@ def main():
 
     x = np.arange(len(dept_names))
 
-    # 图1: 30年预测 - 各组合 vs 官方参数1
+    # 图1: 30年预测 - 各组合 vs 非backup官方参数1
     ax1 = axes[0, 0]
     colors = plt.cm.tab20(np.linspace(0, 1, len(sorted_combo_names)))
     for i, combo_name in enumerate(sorted_combo_names):
@@ -487,7 +739,7 @@ def main():
             pred = all_pred_30[combo_name]
             ax1.plot(x, pred, 'o-', label=combo_name, color=colors[i],
                      alpha=0.7, markersize=3)
-    ax1.plot(x, official_param1, 'k--', label='官方参数1', linewidth=2)
+    ax1.plot(x, official_param1_30, 'k--', label='官方参数1', linewidth=2)
     ax1.set_ylabel('编制人数（含组织员）')
     ax1.set_title('2030年预测：各组合预测 vs 官方参数1', fontweight='bold')
     ax1.set_xticks(x)
@@ -500,7 +752,7 @@ def main():
     for i, combo_name in enumerate(sorted_combo_names):
         if i < 5:
             pred = all_pred_30[combo_name]
-            ax2.plot(x, pred - official_param1, 'o-', label=combo_name,
+            ax2.plot(x, pred - official_param1_30, 'o-', label=combo_name,
                      color=colors[i], alpha=0.7, markersize=3)
     ax2.axhline(y=0, color='black', linestyle='--', linewidth=1)
     ax2.set_ylabel('偏差（预测 - 官方参数1）')
@@ -527,8 +779,8 @@ def main():
     ax4 = axes[1, 1]
     best_combo = sorted_combo_names[0]
     best_pred = all_pred_30[best_combo]
-    max_val = max(official_param1.max(), best_pred.max()) * 1.1
-    ax4.scatter(official_param1, best_pred, c='#e74c3c', alpha=0.7, s=60,
+    max_val = max(official_param1_30.max(), best_pred.max()) * 1.1
+    ax4.scatter(official_param1_30, best_pred, c='#e74c3c', alpha=0.7, s=60,
                edgecolors='white', zorder=3)
     ax4.plot([0, max_val], [0, max_val], 'k--', alpha=0.5, label='y=x', zorder=1)
     ax4.set_xlabel('官方参数1', fontsize=10)
@@ -558,8 +810,8 @@ def main():
     for i, combo_name in enumerate(sorted_combo_names[:n_combos_plot]):
         ax = axes2[i]
         pred = all_pred_30[combo_name]
-        max_val = max(official_param1.max(), pred.max()) * 1.1
-        ax.scatter(official_param1, pred, c='#e74c3c', alpha=0.7, s=60,
+        max_val = max(official_param1_30.max(), pred.max()) * 1.1
+        ax.scatter(official_param1_30, pred, c='#e74c3c', alpha=0.7, s=60,
                    edgecolors='white', zorder=3)
         ax.plot([0, max_val], [0, max_val], 'k--', alpha=0.5, label='y=x', zorder=1)
         ax.set_xlabel('官方参数1', fontsize=8)
